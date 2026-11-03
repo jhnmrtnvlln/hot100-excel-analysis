@@ -1,0 +1,145 @@
+//POWER QUERY CODE: Billboard Hot 100 analysis
+//Open Data > Get Data > Launch Power Query Editor, then create each query below as a Blank Query and paste the code into the Advanced Editor.
+
+
+//'FilePath' Query (a parameter: change the path to wherever you saved the CSV)
+"C:\h100\h100_history.csv" meta [IsParameterQuery=true, IsParameterQueryRequired=true, Type="Text"]
+
+//----
+
+//'Charts' Query
+let
+    Source = Csv.Document(File.Contents(FilePath), [Delimiter = ",", Columns = 7, Encoding = 65001, QuoteStyle = QuoteStyle.Csv]),
+    Headers = Table.PromoteHeaders(Source, [PromoteAllScalars = true]),
+    Typed = Table.TransformColumnTypes(Headers, {{"chart_date", type date}, {"rank", Int64.Type}, {"title", type text}, {"artist", type text}, {"last_week", type text}, {"peak_pos", Int64.Type}, {"weeks_on_chart", Int64.Type}}, "en-GB"),
+    NoDash = Table.ReplaceValue(Typed, "-", null, Replacer.ReplaceValue, {"last_week"}),
+    LastWeek = Table.TransformColumnTypes(NoDash, {{"last_week", Int64.Type}}),
+    NewEntry = Table.AddColumn(LastWeek, "is_new_entry", each [last_week] = null, type logical)
+in
+    NewEntry
+
+//----
+
+//'ChartDates' Query
+let
+    Src = Table.SelectColumns(Charts, {"chart_date"}),
+    Dist = Table.Distinct(Src),
+    Sorted = Table.Sort(Dist, {{"chart_date", Order.Ascending}}),
+    Seq = Table.AddIndexColumn(Sorted, "chart_seq", 1, 1, Int64.Type),
+    Yr = Table.AddColumn(Seq, "year", each Date.Year([chart_date]), Int64.Type),
+    Dec = Table.AddColumn(Yr, "decade", each Number.IntegerDivide([year], 10) * 10, Int64.Type)
+in
+    Dec
+
+//----
+
+//'Songs' Query
+let
+    Src = Table.SelectColumns(Charts, {"chart_date", "rank", "title", "artist", "weeks_on_chart"}),
+    Grp = Table.Group(Src, {"title", "artist"}, {
+        {"weeks_charted", each Table.RowCount(_), Int64.Type},
+        {"first_chart", each List.Min([chart_date]), type date},
+        {"last_chart", each List.Max([chart_date]), type date},
+        {"peak_rank", each List.Min([rank]), Int64.Type},
+        {"max_weeks_on_chart", each List.Max([weeks_on_chart]), Int64.Type}
+    }),
+    LatestChart = List.Max(Charts[chart_date]),
+    AddEra = Table.AddColumn(Grp, "era", (r) => List.Last(Table.SelectRows(Eras, (e) => e[start_date] <= r[first_chart])[era]), type text),
+    AddPhase = Table.AddColumn(AddEra, "streaming_phase", (r) => if r[first_chart] < #date(2013,3,2) then "Before 02/03/2013" else "From 02/03/2013", type text),
+    AddStill = Table.AddColumn(AddPhase, "still_charting", (r) => r[last_chart] = LatestChart, type logical),
+    AddSong = Table.AddColumn(AddStill, "song", (r) => r[title] & " - " & r[artist], type text),
+    AddDecade = Table.AddColumn(AddSong, "decade", (r) => Number.IntegerDivide(Date.Year(r[first_chart]), 10) * 10, Int64.Type),
+    Sorted = Table.Sort(AddDecade, {{"weeks_charted", Order.Descending}})
+in
+    Sorted
+
+//----
+
+//'Eras' Query
+let
+    Src = #table(
+        type table [era_no = Int64.Type, era = text, start_date = date, end_date = date, rule = text, source = text],
+        {
+            {1, "1. No recurrent rule", #date(1958,8,4), #date(1991,11,23), "No recurrent rule", "Hot 100 history"},
+            {2, "2. 20-week rule", #date(1991,11,30), #date(2015,11,28), "Removed after 20 weeks if below #20, then #40 (chart dated 25 Jan 1992), then #50 (11 Apr 1992)", "Talk of the Charts guide"},
+            {3, "3. 52-week rule", #date(2015,12,5), #date(2025,10,18), "20 weeks / #50, plus 52 weeks / #25", "Talk of the Charts guide"},
+            {4, "4. Tiered rules", #date(2025,10,25), #date(2099,12,31), "New tiers: 20 wks / #50, 26 / #25, 52 / #10, 78 / #5", "Talk of the Charts guide; to check against Billboard"}
+        }
+    )
+in
+    Src
+
+//----
+
+//'RecurrentRules' Query
+let
+    Src = #table(
+        type table [rule_id = Int64.Type, effective_from = date, effective_to = date, min_weeks = Int64.Type, cutoff_rank = Int64.Type, source = text, confidence = text],
+        {
+            {1, #date(1991,11,30), #date(1992,1,18), 20, 20, "Talk of the Charts guide (chart dated 30 Nov 1991)", "from guide"},
+            {2, #date(1992,1,25), #date(1992,4,4), 20, 40, "Talk of the Charts guide (January 1992); exact chart date inferred from Billboard chart records", "date inferred"},
+            {3, #date(1992,4,11), #date(2015,11,28), 20, 50, "Talk of the Charts guide (spring 1992); exact chart date inferred from Billboard chart records", "date inferred"},
+            {4, #date(2015,12,5), #date(2025,10,18), 20, 50, "Talk of the Charts guide", "from guide"},
+            {5, #date(2015,12,5), #date(2025,10,18), 52, 25, "Talk of the Charts guide (Billboard chart dated 5 Dec 2015)", "from guide"},
+            {6, #date(2025,10,25), #date(2099,12,31), 20, 50, "Billboard announcement, via the Talk of the Charts guide", "from guide"},
+            {7, #date(2025,10,25), #date(2099,12,31), 26, 25, "Billboard announcement, via the Talk of the Charts guide", "from guide"},
+            {8, #date(2025,10,25), #date(2099,12,31), 52, 10, "Billboard announcement, via the Talk of the Charts guide", "from guide"},
+            {9, #date(2025,10,25), #date(2099,12,31), 78, 5, "Billboard announcement, via the Talk of the Charts guide", "from guide"}
+        }
+    )
+in
+    Src
+
+//----
+
+//'BypassWeeks' Query
+let
+    Rules = List.Buffer(Table.ToRecords(RecurrentRules)),
+    Candidates = Table.SelectRows(Charts, each [chart_date] >= #date(1991,11,30) and [weeks_on_chart] > 20 and [rank] > 5),
+    Match = Table.AddColumn(Candidates, "rule_hit", (r) => List.Last(List.Select(Rules, (t) => t[effective_from] <= r[chart_date] and r[chart_date] <= t[effective_to] and r[weeks_on_chart] > t[min_weeks] and r[rank] > t[cutoff_rank]), null)),
+    Hits = Table.SelectRows(Match, each [rule_hit] <> null),
+    AddRule = Table.AddColumn(Hits, "rule", (r) => Text.From(r[rule_hit][min_weeks]) & " weeks / below #" & Text.From(r[rule_hit][cutoff_rank]), type text),
+    AddCutoff = Table.AddColumn(AddRule, "rule_cutoff", (r) => r[rule_hit][cutoff_rank], Int64.Type),
+    AddBelow = Table.AddColumn(AddCutoff, "places_below_cutoff", (r) => r[rank] - r[rule_hit][cutoff_rank], Int64.Type),
+    AddMove = Table.AddColumn(AddBelow, "movement", (r) => if r[last_week] = null then "Re-entry" else if r[rank] < r[last_week] then "Rising" else "Flat or falling", type text),
+    AddSong = Table.AddColumn(AddMove, "song", (r) => r[title] & " - " & r[artist], type text),
+    AddYear = Table.AddColumn(AddSong, "year", (r) => Date.Year(r[chart_date]), Int64.Type),
+    Keep = Table.SelectColumns(AddYear, {"chart_date", "year", "song", "title", "artist", "rank", "last_week", "weeks_on_chart", "rule", "rule_cutoff", "places_below_cutoff", "movement"}),
+    Joined = Table.NestedJoin(Keep, {"song"}, Songs, {"song"}, "s", JoinKind.LeftOuter),
+    WithTotal = Table.ExpandTableColumn(Joined, "s", {"weeks_charted"}, {"song_total_weeks"}),
+    Sorted = Table.Sort(WithTotal, {{"chart_date", Order.Descending}, {"rank", Order.Ascending}})
+in
+    Sorted
+
+//----
+
+//'TopMoves' Query
+let
+    Base = Table.SelectRows(Charts, each [last_week] <> null),
+    Moves = Table.Buffer(Table.AddColumn(Base, "places_moved", each [last_week] - [rank], Int64.Type)),
+    JumpCut = List.Sort(Moves[places_moved], Order.Descending){9},
+    FallCut = List.Sort(Moves[places_moved], Order.Ascending){9},
+    Jumps = Table.Sort(Table.AddColumn(Table.SelectRows(Moves, each [places_moved] >= JumpCut), "type", each "Jump", type text), {{"places_moved", Order.Descending}}),
+    Falls = Table.Sort(Table.AddColumn(Table.SelectRows(Moves, each [places_moved] <= FallCut), "type", each "Fall", type text), {{"places_moved", Order.Ascending}}),
+    Combined = Table.Combine({Jumps, Falls}),
+    Keep = Table.SelectColumns(Combined, {"type", "chart_date", "title", "artist", "last_week", "rank", "places_moved"})
+in
+    Keep
+
+//----
+
+//'NumberOneDebuts' Query
+let
+    Src = Table.SelectRows(Charts, each [weeks_on_chart] = 1 and [rank] = 1 and [chart_date] > #date(1958,8,4)),
+    AddYear = Table.AddColumn(Src, "year", each Date.Year([chart_date]), Int64.Type),
+    AddDecade = Table.AddColumn(AddYear, "decade", each Number.IntegerDivide([year], 10) * 10, Int64.Type),
+    Keep = Table.SelectColumns(AddDecade, {"chart_date", "year", "decade", "title", "artist"}),
+    One = Table.Group(Table.SelectRows(Charts, each [rank] = 1), {"title", "artist"}, {{"weeks_at_1", each Table.RowCount(_), Int64.Type}}),
+    J1 = Table.NestedJoin(Keep, {"title", "artist"}, One, {"title", "artist"}, "o", JoinKind.LeftOuter),
+    E1 = Table.ExpandTableColumn(J1, "o", {"weeks_at_1"}),
+    J2 = Table.NestedJoin(E1, {"title", "artist"}, Songs, {"title", "artist"}, "s", JoinKind.LeftOuter),
+    E2 = Table.ExpandTableColumn(J2, "s", {"weeks_charted"}, {"total_weeks_charted"}),
+    Renamed = Table.RenameColumns(E2, {{"chart_date", "debut_date"}}),
+    Sorted = Table.Sort(Renamed, {{"debut_date", Order.Ascending}})
+in
+    Sorted
